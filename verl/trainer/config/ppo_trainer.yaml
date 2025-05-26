@@ -11,6 +11,8 @@ data:
   return_raw_chat: False
   shuffle: True
   image_key: images
+  system_prompt: null
+  post_prompt: null
 
 actor_rollout_ref:
   hybrid_engine: True
@@ -29,6 +31,7 @@ actor_rollout_ref:
     ppo_max_token_len_per_gpu: 16384 # n * ${data.max_prompt_length} + ${data.max_response_length}
     grad_clip: 1.0
     clip_ratio: 0.2
+    use_multi_turn_response_mask: False # True for Multi-Turn Grounding
     entropy_coeff: 0.001
     use_kl_loss: False # True for GRPO
     kl_loss_coef: 0.001 # for grpo
@@ -89,6 +92,11 @@ actor_rollout_ref:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
+    response_length_total: 4096 # total response length in for Multi-Turn ImSearch, include 1st ASSISTANT, 2nd USER, ...
+    max_pixels: 1003520 # 1280*28*28
+    min_pixels: 200704 # 256*28*28
+    sub_image_token_prompt: null
+    ori_image_token_prompt: null
 
 critic:
   strategy: fsdp

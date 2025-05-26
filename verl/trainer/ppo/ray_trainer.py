@@ -24,12 +24,12 @@ from enum import Enum
 from pprint import pprint
 from typing import Type, Dict
 from copy import deepcopy
-
+from tqdm import tqdm
 import numpy as np
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProtoItem
 from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -37,11 +37,19 @@ from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+from verl.utils.dataset.hf_dataset import HFDataset, collate_fn
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 WorkerType = Type[Worker]
 
+def dataprotoitem_to_dataproto(item: DataProtoItem) -> DataProto:
+    """Convert a DataProtoItem to a DataProto object"""
+    return DataProto.from_dict(
+        tensors=item.batch,  # TensorDict is already in correct format
+        non_tensors=item.non_tensor_batch,  # Dict is already in correct format 
+        meta_info=item.meta_info
+    )
 
 class Role(Enum):
     """
@@ -241,6 +249,9 @@ def compute_data_metrics(batch, use_critic=True):
     response_info = _compute_response_info(batch)
     prompt_length = response_info['prompt_length']
     response_length = response_info['response_length']
+    # update response_length for imsearch
+    if 'multi_turn_response_mask' in batch.batch:
+        response_length = batch.batch['multi_turn_response_mask'].sum(dim=1).float()
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
@@ -492,15 +503,36 @@ class RayPPOTrainer(object):
 
     def _create_dataloader(self):
         # TODO: we have to make sure the batch size is divisible by the dp size
-        self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
-                                         tokenizer=self.tokenizer,
-                                         processor=self.processor,
-                                         prompt_key=self.config.data.prompt_key,
-                                         image_key=self.config.data.get('image_key', 'images'),
-                                         max_prompt_length=self.config.data.max_prompt_length,
-                                         filter_prompts=True,
-                                         return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                         truncation='error')
+        if isinstance(self.config.data.train_files, str):
+            self.train_dataset = HFDataset(hf_file=self.config.data.train_files,
+                                            tokenizer=self.tokenizer,
+                                            processor=self.processor,
+                                            prompt_key=self.config.data.prompt_key,
+                                            image_key=self.config.data.get('image_key', 'images'),
+                                            max_prompt_length=self.config.data.max_prompt_length,
+                                            filter_prompts=True,
+                                            return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                            truncation='error',
+                                            system_prompt=self.config.data.get('system_prompt', None),
+                                            post_prompt=self.config.data.get('post_prompt', None),
+                                            max_pixels=self.config.actor_rollout_ref.rollout.max_pixels,
+                                            min_pixels=self.config.actor_rollout_ref.rollout.min_pixels,
+                                            )
+        else:
+            self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
+                                            tokenizer=self.tokenizer,
+                                            processor=self.processor,
+                                            prompt_key=self.config.data.prompt_key,
+                                            image_key=self.config.data.get('image_key', 'images'),
+                                            max_prompt_length=self.config.data.max_prompt_length,
+                                            filter_prompts=True,
+                                            return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                            truncation='error',
+                                            system_prompt=self.config.data.get('system_prompt', None),
+                                            post_prompt=self.config.data.get('post_prompt', None),
+                                            max_pixels=self.config.actor_rollout_ref.rollout.max_pixels,
+                                            min_pixels=self.config.actor_rollout_ref.rollout.min_pixels,
+                                            )
         # use sampler for better ckpt resume
         if self.config.data.shuffle:
             train_dataloader_generator = torch.Generator()
@@ -515,16 +547,37 @@ class RayPPOTrainer(object):
                                                    drop_last=True,
                                                    collate_fn=collate_fn,
                                                    sampler=sampler)
+        assert len(self.train_dataloader) >= 1
+        print(f'Size of train dataloader: {len(self.train_dataloader)}')
 
-        self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
-                                       tokenizer=self.tokenizer,
-                                       processor=self.processor,
-                                       prompt_key=self.config.data.prompt_key,
-                                       image_key=self.config.data.get('image_key', 'images'),
-                                       max_prompt_length=self.config.data.max_prompt_length,
-                                       filter_prompts=True,
-                                       return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                       truncation='error')
+        if isinstance(self.config.data.val_files, str):
+            self.val_dataset = HFDataset(hf_file=self.config.data.val_files,
+                                        tokenizer=self.tokenizer,
+                                        processor=self.processor,
+                                        prompt_key=self.config.data.prompt_key,
+                                        image_key=self.config.data.get('image_key', 'images'),
+                                        max_prompt_length=self.config.data.max_prompt_length,
+                                        filter_prompts=True,
+                                        return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                        truncation='error',
+                                        system_prompt=self.config.data.get('system_prompt', None),
+                                        post_prompt=self.config.data.get('post_prompt', None),
+                                        max_pixels=self.config.actor_rollout_ref.rollout.max_pixels,
+                                        min_pixels=self.config.actor_rollout_ref.rollout.min_pixels)
+        else:
+            self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
+                                        tokenizer=self.tokenizer,
+                                        processor=self.processor,
+                                        prompt_key=self.config.data.prompt_key,
+                                        image_key=self.config.data.get('image_key', 'images'),
+                                        max_prompt_length=self.config.data.max_prompt_length,
+                                        filter_prompts=True,
+                                        return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                        truncation='error',
+                                        system_prompt=self.config.data.get('system_prompt', None),
+                                        post_prompt=self.config.data.get('post_prompt', None),
+                                        max_pixels=self.config.actor_rollout_ref.rollout.max_pixels,
+                                        min_pixels=self.config.actor_rollout_ref.rollout.min_pixels)
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
             # Validation datasets are sent to inference engines as a whole batch,
@@ -627,10 +680,10 @@ class RayPPOTrainer(object):
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
 
-            if 'multi_modal_inputs' in test_batch.non_tensor_batch.keys():
+            if 'multi_modal_data' in test_batch.non_tensor_batch.keys():
                 test_gen_batch = test_batch.pop(
-                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                    non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids', 'input_height', 'input_width'],
+                    non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'image_path', 'question', 'choices'],
                 )
             else:
                 test_gen_batch = test_batch.pop(
@@ -880,7 +933,7 @@ class RayPPOTrainer(object):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True) and self.config.trainer.test_freq != -1:
             val_metrics = self._validate()
             pprint(f'Initial validation metrics: {val_metrics}')
             logger.log(data=val_metrics, step=self.global_steps)
@@ -898,10 +951,10 @@ class RayPPOTrainer(object):
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
-                if 'multi_modal_inputs' in batch.non_tensor_batch.keys():
+                if 'multi_modal_data' in batch.non_tensor_batch.keys():
                     gen_batch = batch.pop(
-                        batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                        non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
+                        batch_keys=['input_ids', 'attention_mask', 'position_ids', 'input_height', 'input_width'],
+                        non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'image_path', 'question', 'choices'],
                     )
                 else:
                     gen_batch = batch.pop(

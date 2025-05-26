@@ -32,6 +32,9 @@ from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+from verl.utils import hf_processor
+import numpy as np
+import os
 
 __all__ = ['DataParallelPPOActor']
 
@@ -54,6 +57,9 @@ class DataParallelPPOActor(BasePPOActor):
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
+
+        # add qwen processor
+        self.processor = hf_processor(config.model_local_path)
 
     def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -192,12 +198,19 @@ class DataParallelPPOActor(BasePPOActor):
 
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids']
         batch = data.select(batch_keys=select_keys).batch
-        has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
+        has_multi_modal_inputs = 'multi_modal_data' in data.non_tensor_batch.keys()
 
         if has_multi_modal_inputs:
-            num_micro_batches = data.batch.batch_size[0] // micro_batch_size
+            # NOTE: transform 'multi_modal_data' to 'multi_modal_inputs'
+            _processed_images = [self.processor.image_processor(_multi_modal_data['image'], return_tensors='pt') for _multi_modal_data in data.non_tensor_batch['multi_modal_data']]
+            _processed_images = [{key: val for key, val in image_inputs.items()} for image_inputs in _processed_images]
+            _multi_modal_inputs = np.array(_processed_images, dtype=object)
+            data.non_tensor_batch['multi_modal_inputs'] = _multi_modal_inputs
+            del data.non_tensor_batch['multi_modal_data']
+            # num_micro_batches = data.batch.batch_size[0] // micro_batch_size
             non_tensor_select_keys = ['multi_modal_inputs']
-            micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+            # micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+            micro_batches = data.select(select_keys, non_tensor_select_keys).multimodal_data_split(micro_batch_size)
         elif use_dynamic_bsz:
             # split using dynamic bsz
             max_token_len = data.meta_info['max_token_len'] * self.ulysses_sequence_parallel_size
@@ -230,17 +243,29 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
 
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
+        use_multi_turn_response_mask = self.config.get("use_multi_turn_response_mask", False)
+        if use_multi_turn_response_mask:
+            select_keys.append('multi_turn_response_mask')
+        if self.config.use_kl_loss:
+            select_keys.append('ref_log_prob')
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
         batch = data.select(batch_keys=select_keys).batch
-        has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
+        has_multi_modal_inputs = 'multi_modal_data' in data.non_tensor_batch.keys()
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         if has_multi_modal_inputs:
-            num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
+            # NOTE: transform 'multi_modal_data' to 'multi_modal_inputs'
+            _processed_images = [self.processor.image_processor(_multi_modal_data['image'], return_tensors='pt') for _multi_modal_data in data.non_tensor_batch['multi_modal_data']]
+            _processed_images = [{key: val for key, val in image_inputs.items()} for image_inputs in _processed_images]
+            _multi_modal_inputs = np.array(_processed_images, dtype=object)
+            data.non_tensor_batch['multi_modal_inputs'] = _multi_modal_inputs
+            del data.non_tensor_batch['multi_modal_data']
+            # num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
             non_tensor_select_keys = ['multi_modal_inputs']
-            dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
+            # dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
+            dataloader = data.select(select_keys, non_tensor_select_keys).multimodal_data_split(self.config.ppo_mini_batch_size)
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
@@ -251,8 +276,9 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batch = data
                 if has_multi_modal_inputs:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
-                    micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+                    # num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+                    # micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+                    micro_batches = data.select(select_keys, non_tensor_select_keys).multimodal_data_split(self.config.ppo_micro_batch_size_per_gpu)
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
@@ -272,7 +298,13 @@ class DataParallelPPOActor(BasePPOActor):
                     responses = data['responses']
                     response_length = responses.size(1)
                     attention_mask = data['attention_mask']
-                    response_mask = attention_mask[:, -response_length:]
+                    # response_mask = attention_mask[:, -response_length:]
+                    # Refine 'response_mask' by 'multi_turn_response_mask' for multi-turn scenario
+                    if use_multi_turn_response_mask:
+                        multi_turn_response_mask = data['multi_turn_response_mask']
+                        response_mask = (attention_mask * multi_turn_response_mask)[:, -response_length:]
+                    else:
+                        response_mask = attention_mask[:, -response_length:]
                     old_log_prob = data['old_log_probs']
                     advantages = data['advantages']
 

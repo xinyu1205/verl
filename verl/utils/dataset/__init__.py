@@ -15,3 +15,4 @@
 from .rl_dataset import RLHFDataset
 from .rm_dataset import RMDataset
 from .sft_dataset import SFTDataset
+from .hf_dataset import HFDataset

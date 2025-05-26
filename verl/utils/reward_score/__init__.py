@@ -33,6 +33,9 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
     elif data_source in ['hiyouga/geometry3k']:
         from . import geo3k
         res = geo3k.compute_score(solution_str, ground_truth)
+    elif data_source in ['Perception/OCR with Complex Context', 'Perception/Remote Sensing', 'v_star', 'Perception/Diagram and Table', 'Perception/Monitoring', 'Reasoning/OCR with Complex Context', 'Perception/Autonomous_Driving', 'Reasoning/Autonomous_Driving', 'Reasoning/Diagram and Table', 'Reasoning/Monitoring', 'mme_realworld/perception_ocr', 'mme_realworld/perception_remote']:
+        from . import high_resolution
+        res = high_resolution.compute_score(solution_str, ground_truth)
     else:
         raise NotImplementedError
 

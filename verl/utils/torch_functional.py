@@ -146,6 +146,34 @@ def masked_whiten(values, mask, shift_mean=True):
         whitened += mean
     return whitened
 
+def get_final_eos_mask(response_id: torch.Tensor, eos_token: Union[int, List[int]] = 2, dtype=torch.int64):
+    """
+    Modified logic to capture up to the last EOS:
+    1. Find all positions of eos_token.
+    2. Flip the sequence and perform a cumulative sum (cumsum).
+    3. Positions where cumsum > 0 indicate that, in the original sequence, these are after (and including) the last EOS.
+    4. Flip back to the original order: positions up to and including the last EOS are 1, others are 0.
+    If you need to handle the case where there is no eos_token (i.e., all positions should be 1), you can additionally check if the cumsum is all zeros.
+    """
+    if isinstance(eos_token, int):
+        eos_token = [eos_token]
+
+    # Find all positions of the eos_token
+    eos_mask = torch.zeros_like(response_id, dtype=torch.bool)
+    for token in eos_token:
+        eos_mask |= response_id.eq(token)
+
+    # Convert to 0/1
+    eos_mask = eos_mask.long()
+
+    # Flip -> cumsum -> check > 0 -> flip back
+    reversed_mask = torch.flip(eos_mask, dims=[1])
+    reversed_cumsum = torch.cumsum(reversed_mask, dim=1)
+    # If cumsum > 0, it means this position (in the original sequence) is at or before the last EOS
+    new_mask = reversed_cumsum.gt(0)
+    new_mask = torch.flip(new_mask, dims=[1])
+
+    return new_mask.to(dtype)
 
 def get_eos_mask(response_id: torch.Tensor, eos_token: Union[int, List[int]] = 2, dtype=torch.int64):
     '''

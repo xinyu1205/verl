@@ -518,6 +518,36 @@ class DataProto:
 
         return output
 
+    def multimodal_data_split(self, split_size: int) -> List['DataProto']:
+        """Split the batch among dim=0 into chunks. The meta_info is passed to each DataProto after split.
+        Args:
+            split_size (int): the number of items in each chunk
+        Returns:
+            List[DataProto]: a list of DataProto after splitting
+        """
+        
+        num_chunks = (len(self.batch) + split_size - 1) // split_size
+        last_chunk_size = len(self.batch) % split_size
+        if self.batch is not None:
+            batch_lst = self.batch.split(split_size=split_size, dim=0)
+        else:
+            batch_lst = [None for _ in range(num_chunks)]
+        non_tensor_batch_lst = [{} for _ in range(num_chunks)]
+        per_chunk_size = [split_size] * num_chunks
+        if last_chunk_size != 0:
+            per_chunk_size[-1] = last_chunk_size
+        for key, val in self.non_tensor_batch.items():
+            assert isinstance(val, np.ndarray)
+            non_tensor_lst = np.array_split(val, np.cumsum(per_chunk_size)[:-1])
+            assert len(non_tensor_lst) == num_chunks
+            for i in range(num_chunks):
+                non_tensor_batch_lst[i][key] = non_tensor_lst[i]
+        output = []
+        for i in range(num_chunks):
+            output.append(
+                DataProto(batch=batch_lst[i], non_tensor_batch=non_tensor_batch_lst[i], meta_info=self.meta_info))
+        return output
+
     @staticmethod
     def concat(data: List['DataProto']) -> 'DataProto':
         """Concat a list of DataProto. The batch is concatenated among dim=0.

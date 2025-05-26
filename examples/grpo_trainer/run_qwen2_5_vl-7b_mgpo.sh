@@ -1,0 +1,52 @@
+set -x
+
+export VLLM_ATTENTION_BACKEND=XFORMERS
+
+python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
+    data.train_files=xinyu1205/mme_realworld_train_21690 \
+    data.val_files=xinyu1205/mme_realworld_lite_1919_vstar_191_sum_2110 \
+    'data.system_prompt="You are a helpful assistant. Given an image and one question. First, identify the coordinates of the key image area relevant to solving the problem. Append the coordinates in JSON format at the end of your response and stop. This will trigger cropping of the corresponding area in the original image and enlarge it for improved clarity. Once the enlarged image is available, provide the final answer (A, B, C, D, or E) enclosed within \\boxed{}."' \
+    'data.post_prompt="Out the coordinates of the key image area relevant to the problem in JSON format."' \
+    data.train_batch_size=512 \
+    data.max_prompt_length=8192 \
+    data.max_response_length=8192 \
+    data.image_key=image \
+    actor_rollout_ref.model.path=Qwen/Qwen2.5-VL-7B-Instruct \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.01 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.use_multi_turn_response_mask=True \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.free_cache_engine=False \
+    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
+    actor_rollout_ref.rollout.response_length_total=12192 \
+    actor_rollout_ref.rollout.max_pixels=1003520 \
+    actor_rollout_ref.rollout.min_pixels=200704 \
+    'actor_rollout_ref.rollout.sub_image_token_prompt="\n<|im_start|>user\nBased on the provided coordinates, return the sub-image:\n<|vision_start|><|image_pad|><|vision_end|>\nQuestion: {question} {choices}Carefully analyze both the original image and the enlarged sub-image to solve the question step by step. If the sub-image does not provide sufficient information, refer to the original image to find the solution. Present your reasoning clearly, and provide the final answer (A, B, C, D, or E) enclosed within \\boxed{{}}.<|im_end|>\n<|im_start|>assistant\n"' \
+    'actor_rollout_ref.rollout.ori_image_token_prompt="\n<|im_start|>user\nNot providing correct coordinates or invalid coordinate values, return the original image:\n<|vision_start|><|image_pad|><|vision_end|>\nQuestion: {question} {choices}Carefully analyze the original image to solve the question step by step. Present your reasoning clearly, and provide the final answer (A, B, C, D, or E) enclosed within \\boxed{{}}.<|im_end|>\n<|im_start|>assistant\n"' \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    algorithm.kl_ctrl.kl_coef=0.001 \
+    trainer.critic_warmup=0 \
+    trainer.logger=['console','wandb'] \
+    trainer.project_name='verl_grpo_example_mgpo' \
+    trainer.experiment_name='qwen2_5_vl_7b_function_rm' \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=1 \
+    trainer.save_freq=-1 \
+    trainer.test_freq=5 \
+    trainer.total_epochs=15 $@
